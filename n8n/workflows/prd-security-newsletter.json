@@ -1,0 +1,523 @@
+{
+  "updatedAt": "2026-09-01T06:35:49.556Z",
+  "createdAt": "2026-02-05T07:36:02.533Z",
+  "id": "ADvWVxd8v86pU7mYRxVTa",
+  "name": "prd-보안 뉴스레터",
+  "description": null,
+  "active": true,
+  "isArchived": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "months",
+              "triggerAtHour": 9
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -1040,
+        0
+      ],
+      "id": "ff85ddde-5ac1-477c-aa07-3ab149180735",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "url": "https://www.dailysecu.com/rss/clickTop.xml",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.2,
+      "position": [
+        -768,
+        -80
+      ],
+      "id": "482fce4a-d4fc-4a22-bc97-aee300add350",
+      "name": "dailysecu"
+    },
+    {
+      "parameters": {
+        "numberInputs": 4
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        -480,
+        -48
+      ],
+      "id": "c3c90fcd-dc3a-4999-ae59-a110f8a4404c",
+      "name": "newsMerge"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// 정보보안 뉴스 필터링 + 근거기반 요약 프롬프트 (v5.2-grounded)\n// 작성일: 2026-02-09\n// 목표: EXAONE 7.8B 환각 최소화 (제목-only 제거, 원문 스니펫 강제, 구조화 출력)\n// ============================================================\n\nconst rssArticles = $input.all() || [];\n\nif (rssArticles.length === 0) {\n  throw new Error('RSS 데이터가 없습니다. RSS 노드 연결을 확인하세요.');\n}\n\n// 응답 스키마 강제 사용 여부 (모델/게이트웨이가 미지원이면 false로 변경)\nconst USE_JSON_SCHEMA = true;\n\n// 기사별 전달 텍스트 최대 길이 (너무 길면 소형 모델 환각/혼선 증가)\nconst MAX_CHARS_PER_ARTICLE = 1800;\n\n// ============================================================\n// 1. 키워드 가중치 정의 (한글/영어 통합)\n// ============================================================\nconst keywordWeights = [\n  [\"랜섬웨어\", 8], [\"랜섬\", 8], [\"ransom\", 8], [\"ransomware\", 8],\n  [\"제로데이\", 8], [\"0-day\", 8], [\"zero-day\", 8], [\"zeroday\", 8],\n\n  [\"유출\", 7], [\"개인정보\", 7], [\"leak\", 7], [\"data breach\", 7],\n  [\"피싱\", 6], [\"phish\", 6], [\"phishing\", 6],\n  [\"공급망\", 6], [\"supply\", 6], [\"supply chain\", 6],\n  [\"apt\", 6], [\"apt공격\", 6], [\"해킹\", 6], [\"hacking\", 6],\n\n  [\"침해\", 5], [\"사이버 공격\", 5], [\"cyber attack\", 5],\n  [\"악성코드\", 5], [\"malware\", 5], [\"바이러스\", 5],\n  [\"취약점\", 4], [\"cve\", 4], [\"vulnerability\", 4],\n  [\"계정\", 4], [\"자격증명\", 4], [\"credential\", 4],\n  [\"ddos\", 4], [\"디도스\", 4],\n\n  [\"사이버\", 3], [\"보안사고\", 3], [\"security\", 3],\n  [\"패치\", 3], [\"업데이트\", 3], [\"patch\", 3],\n  [\"클라우드\", 2], [\"cloud\", 2],\n  [\"microsoft\", 2], [\"google\", 2], [\"apple\", 2]\n];\n\n// ============================================================\n// 2. 제외 키워드 (금융/투자/비보안 일반 뉴스 차단)\n// ============================================================\nconst excludeKeywords = [\n  '가격', '시세', '전망', '상승', '하락', '투자',\n  '매수', '매도', '거래량', '시가총액', '주식', '증권',\n  'etf', '비트코인', '코인', '순유출', '비중 감축',\n  '달러 유출', '알트코인', '이더리움', '리플',\n  '배당', '수익률', '포트폴리오', '자산운용', '토큰', 'nft 가격',\n  '날씨', '기온', '강수', '태풍', '폭염', '한파',\n  '축구', '야구', '농구', '배구', '골프', '올림픽', '월드컵', '스포츠',\n  '연예', '가수', '배우', '드라마', '영화', '음악', '예능', '방송',\n  '인수합병', 'm&a', '지분 인수', '투자 유치', '상장', 'ipo', '기업공개',\n  '매출', '영업이익', '순이익', '실적', '분기 실적',\n  '채용', '구인', '입사', '퇴사', '이직', '인사발령', '승진',\n  '부동산', '아파트', '재개발', '분양', '자동차'\n];\n\n// ============================================================\n// 3. 텍스트 정규화/추출 유틸\n// ============================================================\nfunction stripHtml(input) {\n  return String(input || '')\n    .replace(/<script[\\s\\S]*?<\\/script>/gi, ' ')\n    .replace(/<style[\\s\\S]*?<\\/style>/gi, ' ')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/&nbsp;/gi, ' ')\n    .replace(/&amp;/gi, '&')\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\nfunction normalizeText(input) {\n  return stripHtml(input)\n    .replace(/[\\u200B-\\u200D\\uFEFF]/g, '')\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\nfunction clip(text, maxLen) {\n  if (!text) return '';\n  if (text.length <= maxLen) return text;\n  return text.slice(0, maxLen) + ' ...[TRUNCATED]';\n}\n\nfunction getArticleSourceText(article) {\n  const title = normalizeText(article.json.title || '');\n  const desc = normalizeText(article.json.description || article.json.summary || '');\n  const content = normalizeText(article.json.content || article.json['content:encoded'] || article.json.contentSnippet || '');\n\n  // 중복 제거: content가 desc를 포함하면 content 우선\n  let merged = '';\n  if (content && desc && content.includes(desc)) {\n    merged = content;\n  } else {\n    merged = [desc, content].filter(Boolean).join(' ');\n  }\n\n  return {\n    title,\n    sourceText: clip(merged, MAX_CHARS_PER_ARTICLE)\n  };\n}\n\n// ============================================================\n// 4. 마케팅/제품 콘텐츠 감지\n// ============================================================\nfunction isMarketingContent(article) {\n  const title = normalizeText(article.json.title || '').toLowerCase();\n\n  const marketingPatterns = [\n    /솔루션\\s*(출시|공개|선보|론칭)/,\n    /제품\\s*(출시|공개|선보|론칭)/,\n    /신제품/,\n    /스토리지.*출시/,\n    /백업.*솔루션.*출시/,\n    /(론칭|런칭|launching)/,\n    /새로운\\s*제품/,\n    /출시.*예정/,\n\n    /참가.*전시/,\n    /개최.*컨퍼런스/,\n    /전시회.*참가/,\n    /공급\\s*개시/,\n    /라인업.*확대/,\n\n    /\\d+위\\s*(선정|차지|달성|기록|올라)/,\n    /(1|2|3|첫|톱|일)위.*선정/,\n    /선정.*\\d+위/,\n    /랭킹.*\\d+위/,\n    /순위.*\\d+위/,\n    /(수상|선정|인정).*왕좌/,\n    /\\d+년\\s*연속/,\n    /top\\s*\\d+/i,\n    /부문\\s*\\d+위/,\n    /매체\\s*선정/,\n    /어워드.*수상/,\n    /수상.*영예/,\n    /대상.*수상/,\n    /왕좌.*지켰다/,\n    /최우수.*선정/,\n    /연간.*랭킹/,\n    /글로벌.*순위/\n  ];\n\n  const securityExceptions = [\n    '취약점', '패치', '보안 업데이트', '공격', '해킹',\n    '랜섬웨어', '악성코드', '유출', '침해', '피해',\n    '사고', '공격 대상', '위협'\n  ];\n\n  if (securityExceptions.some(exc => title.includes(exc))) {\n    return false;\n  }\n\n  return marketingPatterns.some(pattern => pattern.test(title));\n}\n\n// ============================================================\n// 5. 키워드 점수 계산\n// ============================================================\nfunction calculateKeywordScore(article) {\n  const { title, sourceText } = getArticleSourceText(article);\n  const fullText = `${title} ${sourceText}`.toLowerCase();\n\n  for (const keyword of excludeKeywords) {\n    if (fullText.includes(keyword.toLowerCase())) {\n      return { score: 0, keywords: ['제외: ' + keyword] };\n    }\n  }\n\n  if (isMarketingContent(article)) {\n    return { score: 0, keywords: ['제외: 제품홍보'] };\n  }\n\n  let score = 0;\n  const matchedKeywords = [];\n  const countedKeywords = new Set();\n\n  for (const [keyword, weight] of keywordWeights) {\n    const k = keyword.toLowerCase();\n    if (countedKeywords.has(k)) continue;\n\n    if (title.toLowerCase().includes(k)) {\n      score += weight * 2;\n      matchedKeywords.push(`${keyword}(제목×2)`);\n      countedKeywords.add(k);\n    } else if (fullText.includes(k)) {\n      score += weight;\n      matchedKeywords.push(keyword);\n      countedKeywords.add(k);\n    }\n  }\n\n  return { score, keywords: matchedKeywords };\n}\n\n// ============================================================\n// 6. 전체 기사 점수 계산\n// ============================================================\nconst articlesWithScore = rssArticles.map(art => {\n  const result = calculateKeywordScore(art);\n  const { title, sourceText } = getArticleSourceText(art);\n\n  return {\n    article: art,\n    score: result.score,\n    keywords: result.keywords,\n    title,\n    sourceText,\n    pubDate: new Date(art.json.pubDate || art.json.isoDate || art.json.published || 0)\n  };\n});\n\nconst filteredArticles = articlesWithScore.filter(item => item.score > 0 && item.sourceText.length > 0);\n\nconsole.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');\nconsole.log(`📊 RSS 수집: ${rssArticles.length}개`);\nconsole.log(`✅ 필터링 후: ${filteredArticles.length}개`);\nconsole.log(`❌ 제외됨: ${rssArticles.length - filteredArticles.length}개`);\nconsole.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');\n\nconst excluded = articlesWithScore.filter(item => item.score === 0 || !item.sourceText);\nif (excluded.length > 0) {\n  console.log('\\n🚫 제외된 기사 예시 (최대 3개):');\n  excluded.slice(0, 3).forEach(item => {\n    console.log(`   • ${item.article.json.title || '(제목없음)'}`);\n    console.log(`     사유: ${item.sourceText ? item.keywords.join(', ') : '본문 없음'}`);\n  });\n}\n\nif (filteredArticles.length === 0) {\n  console.log('\\n⚠️ 정보보안 관련 기사가 없습니다.');\n  return [];\n}\n\n// ============================================================\n// 7. 정렬 (점수 내림차순 → 날짜 최신순)\n// ============================================================\nconst sortedArticles = filteredArticles.sort((a, b) => {\n  if (b.score !== a.score) return b.score - a.score;\n  return b.pubDate - a.pubDate;\n});\n\n// ============================================================\n// 8. 중복 제거 및 TOP 5 선정 (링크 + 제목 기준)\n// ============================================================\nconst uniqueTop5 = [];\nconst seenLinks = new Set();\nconst seenTitles = new Set();\n\nfor (const item of sortedArticles) {\n  const link = item.article.json.link || item.article.json.guid || item.article.json.url || '';\n  const titleKey = (item.title || '').toLowerCase();\n\n  const isDupByLink = !!link && seenLinks.has(link);\n  const isDupByTitle = !!titleKey && seenTitles.has(titleKey);\n\n  if (!isDupByLink && !isDupByTitle) {\n    uniqueTop5.push(item);\n    if (link) seenLinks.add(link);\n    if (titleKey) seenTitles.add(titleKey);\n  }\n\n  if (uniqueTop5.length >= 5) break;\n}\n\nconst topArticles = uniqueTop5.map(item => item.article);\nconst articleUrls = topArticles.map(art =>\n  art.json.link || art.json.guid || art.json.url || 'https://www.boannews.com'\n);\n\nconsole.log('\\n🏆 선택된 TOP 5 기사:');\nuniqueTop5.forEach((item, i) => {\n  console.log(`\\n${i + 1}. [${item.score}점] ${item.title || item.article.json.title}`);\n  console.log(`   📅 ${item.pubDate.toLocaleString('ko-KR')}`);\n  console.log(`   🔑 ${item.keywords.slice(0, 3).join(', ')}`);\n});\nconsole.log('\\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\\n');\n\n// ============================================================\n// 9. LLM 입력 데이터 구성 (제목-only 금지)\n// ============================================================\nconst groundedArticles = uniqueTop5.map((item, i) => ({\n  id: i + 1,\n  title: item.title || `제목없음-${i + 1}`,\n  url: item.article.json.link || item.article.json.guid || item.article.json.url || '',\n  published_at: isNaN(item.pubDate.getTime()) ? null : item.pubDate.toISOString(),\n  source_text: item.sourceText\n}));\n\n// ============================================================\n// 10. 프롬프트 (환각 억제: 원문 근거 강제)\n// ============================================================\nconst systemPrompt = `역할: 당신은 20년차 정보보안 뉴스 요약 전문가다.\n\n핵심 원칙:\n1) 반드시 입력으로 주어진 source_text 안에서만 작성한다.\n2) source_text에 없는 정보는 절대 쓰지 않는다.\n3) 불확실하거나 근거가 없으면 \"정보부족\"이라고 쓴다.\n4) 기사별 summary_bullets에는 추론/예측/산업 연결을 금지한다.\n5) monthly_insights에서는 5개 기사 공통 패턴을 근거로 의료 환경 관점의 주의사항을 제한적으로 추론할 수 있다.\n6) monthly_insights는 환자정보 보호, 진료 연속성, 의료기기/협력사 보안, 계정·접근통제 관점 중 최소 2개를 반드시 포함한다.\n7) 각 문장은 한국어 평서문으로 작성한다.\n8) 출력은 지정된 JSON 스키마만 따른다.`;\n\nconst userPrompt = `아래 5개 기사 데이터만 사용해 요약하라.\n반드시 각 기사에 id와 title을 포함하라.\ntitle은 입력 기사 JSON의 title 문자열을 한 글자도 바꾸지 말고 그대로 복사하라.\n각 기사마다 summary_bullets는 정확히 3개로 작성하라.\n각 bullet은 source_text의 사실을 재서술하고, 원문 근거 구절을 evidence_quotes에 짧게 넣어라.\n근거를 찾지 못하면 해당 bullet은 \"정보부족\"으로 작성하고 evidence_quotes는 빈 배열로 둬라.\n마지막에 monthly_insights는 정확히 3개 문장으로 작성하라.\nmonthly_insights는 의료 환경에서 실제 운영 시 주의해야 할 행동 중심 문장으로 작성하라.\nmonthly_insights에는 특정 기관명을 직접 쓰지 마라.\nmonthly_insights는 특정 고정 주어 표현으로 시작하지 마라.\n\n입력 기사 JSON:\n${JSON.stringify(groundedArticles, null, 2)}`;\n\n// Structured output schema (Context7 근거: strict + additionalProperties:false)\nconst summarySchema = {\n  type: 'json_schema',\n  json_schema: {\n    name: 'security_news_grounded_summary',\n    strict: true,\n    schema: {\n      type: 'object',\n      additionalProperties: false,\n      required: ['articles', 'monthly_insights'],\n      properties: {\n        articles: {\n          type: 'array',\n          minItems: groundedArticles.length,\n          maxItems: groundedArticles.length,\n          items: {\n            type: 'object',\n            additionalProperties: false,\n            required: ['id', 'title', 'summary_bullets', 'evidence_quotes'],\n            properties: {\n              id: { type: 'integer' },\n              title: { type: 'string' },\n              summary_bullets: {\n                type: 'array',\n                minItems: 3,\n                maxItems: 3,\n                items: { type: 'string' }\n              },\n              evidence_quotes: {\n                type: 'array',\n                minItems: 3,\n                maxItems: 3,\n                items: {\n                  type: 'array',\n                  items: { type: 'string' }\n                }\n              }\n            }\n          }\n        },\n        monthly_insights: {\n          type: 'array',\n          minItems: 3,\n          maxItems: 3,\n          items: { type: 'string' }\n        }\n      }\n    }\n  }\n};\n\nconst payload = {\n  model: 'exaone',\n  messages: [\n    { role: 'system', content: systemPrompt },\n    { role: 'user', content: userPrompt }\n  ],\n  temperature: 0,\n  top_p: 0.1,\n  max_tokens: 3500,\n  article_urls: articleUrls,\n  article_titles: groundedArticles.map((a) => a.title),\n  article_title_map: Object.fromEntries(groundedArticles.map((a) => [String(a.id), a.title])),\n  metadata: {\n    total_articles: rssArticles.length,\n    filtered_count: filteredArticles.length,\n    excluded_count: rssArticles.length - filteredArticles.length,\n    top5_scores: uniqueTop5.map(item => item.score),\n    grounded_input_chars: groundedArticles.map(a => a.source_text.length),\n    generated_at: new Date().toISOString(),\n    version: '5.2-grounded-json'\n  }\n};\n\nif (USE_JSON_SCHEMA) {\n  payload.response_format = summarySchema;\n}\n\nreturn [{ json: payload }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -224,
+        -16
+      ],
+      "id": "583d5169-90aa-4820-a3b6-788e34e0fe49",
+      "name": "extract_news"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8080/v1/chat/completions",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"={{ $json.model }}\",\n  \"messages\": {{ JSON.stringify($json.messages) }},\n  \"temperature\": {{ $json.temperature }},\n  \"max_tokens\": {{ $json.max_tokens }}\n}\n",
+        "options": {
+          "timeout": "=1200000"
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        16,
+        -16
+      ],
+      "id": "07f33e11-4ba1-4ab7-8ea6-f13fe0494309",
+      "name": "exaone_ai"
+    },
+    {
+      "parameters": {
+        "jsCode": "const now = new Date();\nconst year = now.getFullYear();\nconst month = now.getMonth() + 1;\n\nconst httpResponse = $input.first();\nif (!httpResponse || !httpResponse.json) {\n  throw new Error('HTTP Request 응답 없음');\n}\n\nconst aiResponse = httpResponse.json;\n\nfunction escapeHtml(input) {\n  return String(input || '')\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;')\n    .replace(/\"/g, '&quot;')\n    .replace(/'/g, '&#39;');\n}\n\nfunction stripCodeFence(value) {\n  return String(value || '')\n    .replace(/^```json\\s*/i, '')\n    .replace(/^```\\s*/i, '')\n    .replace(/```\\s*$/i, '')\n    .trim();\n}\n\nfunction safeJsonParse(value) {\n  if (typeof value !== 'string') return null;\n  const stripped = stripCodeFence(value);\n  if (!stripped) return null;\n\n  try {\n    return JSON.parse(stripped);\n  } catch (_) {\n    return null;\n  }\n}\n\nfunction tryParseJsonFragments(value) {\n  if (typeof value !== 'string') return null;\n  const text = stripCodeFence(value);\n  if (!text) return null;\n\n  const direct = safeJsonParse(text);\n  if (direct) return direct;\n\n  // 문자열 내부 JSON 블록을 브레이스 매칭으로 추출\n  for (let i = 0; i < text.length; i++) {\n    if (text[i] !== '{') continue;\n\n    let depth = 0;\n    let inString = false;\n    let escape = false;\n\n    for (let j = i; j < text.length; j++) {\n      const ch = text[j];\n\n      if (inString) {\n        if (escape) {\n          escape = false;\n        } else if (ch === '\\\\') {\n          escape = true;\n        } else if (ch === '\"') {\n          inString = false;\n        }\n      } else {\n        if (ch === '\"') {\n          inString = true;\n        } else if (ch === '{') {\n          depth += 1;\n        } else if (ch === '}') {\n          depth -= 1;\n          if (depth === 0) {\n            const candidate = text.slice(i, j + 1);\n            const parsed = safeJsonParse(candidate);\n            if (parsed) return parsed;\n            break;\n          }\n        }\n      }\n    }\n  }\n\n  return null;\n}\n\nfunction deepFindStructuredObject(node, depth = 0, maxDepth = 10) {\n  if (!node || depth > maxDepth) return null;\n\n  if (typeof node === 'object' && !Array.isArray(node)) {\n    if (Array.isArray(node.articles)) {\n      return node;\n    }\n\n    for (const key of Object.keys(node)) {\n      const found = deepFindStructuredObject(node[key], depth + 1, maxDepth);\n      if (found) return found;\n    }\n  }\n\n  if (Array.isArray(node)) {\n    for (const item of node) {\n      const found = deepFindStructuredObject(item, depth + 1, maxDepth);\n      if (found) return found;\n    }\n  }\n\n  return null;\n}\n\nfunction collectStringCandidates(node, out = [], depth = 0, maxDepth = 10) {\n  if (depth > maxDepth || node == null) return out;\n\n  if (typeof node === 'string') {\n    const t = node.trim();\n    if (t) out.push(t);\n    return out;\n  }\n\n  if (Array.isArray(node)) {\n    for (const item of node) {\n      collectStringCandidates(item, out, depth + 1, maxDepth);\n    }\n    return out;\n  }\n\n  if (typeof node === 'object') {\n    for (const key of Object.keys(node)) {\n      const value = node[key];\n      if (typeof value === 'string') {\n        const t = value.trim();\n        if (t) out.push(t);\n      } else {\n        collectStringCandidates(value, out, depth + 1, maxDepth);\n      }\n    }\n  }\n\n  return out;\n}\n\nfunction extractTextFromKnownShapes(response) {\n  const texts = [];\n\n  const message = response?.choices?.[0]?.message;\n  if (message) {\n    if (typeof message.content === 'string') {\n      texts.push(message.content);\n    }\n    if (Array.isArray(message.content)) {\n      for (const part of message.content) {\n        if (typeof part === 'string') texts.push(part);\n        if (part && typeof part.text === 'string') texts.push(part.text);\n        if (part && typeof part.content === 'string') texts.push(part.content);\n      }\n    }\n  }\n\n  // Responses API: output[].content[].text\n  if (Array.isArray(response?.output)) {\n    for (const item of response.output) {\n      if (typeof item?.output_text === 'string') {\n        texts.push(item.output_text);\n      }\n      if (Array.isArray(item?.content)) {\n        for (const c of item.content) {\n          if (typeof c?.text === 'string') texts.push(c.text);\n        }\n      }\n    }\n  }\n\n  if (typeof response?.output_text === 'string') texts.push(response.output_text);\n  if (typeof response?.response === 'string') texts.push(response.response);\n  if (typeof response?.text === 'string') texts.push(response.text);\n  if (typeof response?.result === 'string') texts.push(response.result);\n\n  return texts.filter(Boolean);\n}\n\nfunction normalizeStructuredShape(candidate) {\n  if (!candidate || typeof candidate !== 'object') return null;\n\n  // 모델이 루트 배열로 반환하는 케이스 지원\n  if (Array.isArray(candidate)) {\n    candidate = { articles: candidate };\n  }\n\n  // 래핑된 형태 지원\n  if (!Array.isArray(candidate.articles) && Array.isArray(candidate.data)) {\n    candidate = { ...candidate, articles: candidate.data };\n  }\n\n  // articles 구조가 문자열일 경우 재시도\n  if (typeof candidate.articles === 'string') {\n    const reparsed = tryParseJsonFragments(candidate.articles);\n    if (reparsed && Array.isArray(reparsed.articles)) {\n      return normalizeStructuredShape(reparsed);\n    }\n  }\n\n  if (!Array.isArray(candidate.articles)) return null;\n\n  let insights = [];\n  if (Array.isArray(candidate.monthly_insights)) {\n    insights = candidate.monthly_insights;\n  } else if (Array.isArray(candidate.insights)) {\n    insights = candidate.insights;\n  } else if (typeof candidate.monthly_insights === 'string') {\n    insights = candidate.monthly_insights\n      .split('\\n')\n      .map(v => v.replace(/^[-•]\\s*/, '').trim())\n      .filter(Boolean);\n  }\n\n  const articles = candidate.articles.map((a, idx) => {\n    const title = String(a?.title || a?.article_title || `기사 ${idx + 1}`).trim();\n\n    let bullets = [];\n    if (Array.isArray(a?.summary_bullets)) {\n      bullets = a.summary_bullets;\n    } else if (Array.isArray(a?.bullets)) {\n      bullets = a.bullets;\n    } else if (typeof a?.summary === 'string') {\n      bullets = a.summary.split(/\\n|•|-/).map(s => s.trim()).filter(Boolean);\n    }\n\n    const normalizedBullets = bullets\n      .map((v) => {\n        if (typeof v === 'string') return v;\n        if (v && typeof v === 'object') {\n          if (typeof v.text === 'string') return v.text;\n          if (typeof v.summary === 'string') return v.summary;\n          if (typeof v.bullet === 'string') return v.bullet;\n        }\n        return '';\n      })\n      .map(v => String(v || '').trim())\n      .filter(Boolean);\n\n    return {\n      id: Number(a?.id || idx + 1),\n      title,\n      summary_bullets: normalizedBullets\n    };\n  });\n\n  return {\n    articles,\n    monthly_insights: insights.map(v => String(v || '').trim()).filter(Boolean)\n  };\n}\n\nfunction normalizeFromParsedValue(parsed) {\n  if (typeof parsed === 'string') {\n    const reparsed = tryParseJsonFragments(parsed);\n    return normalizeStructuredShape(reparsed);\n  }\n  return normalizeStructuredShape(parsed);\n}\n\nfunction getStructuredPayload(response) {\n  // 1) 객체 내 직접 탐색\n  const direct = deepFindStructuredObject(response);\n  const normalizedDirect = normalizeStructuredShape(direct);\n  if (normalizedDirect) return normalizedDirect;\n\n  // 2) SDK parse 경로\n  const parsedMessage = response?.choices?.[0]?.message?.parsed;\n  const normalizedParsedMessage = normalizeStructuredShape(parsedMessage);\n  if (normalizedParsedMessage) return normalizedParsedMessage;\n\n  // 3) 알려진 텍스트 필드에서 JSON 파싱\n  const knownTexts = extractTextFromKnownShapes(response);\n  for (const text of knownTexts) {\n    const parsed = tryParseJsonFragments(text);\n    const normalized = normalizeFromParsedValue(parsed);\n    if (normalized) return normalized;\n  }\n\n  // 4) 전체 객체에서 문자열 수집 후 JSON 파싱\n  const allStrings = collectStringCandidates(response, []);\n  for (const text of allStrings) {\n    const parsed = tryParseJsonFragments(text);\n    const normalized = normalizeFromParsedValue(parsed);\n    if (normalized) return normalized;\n  }\n\n  return null;\n}\n\nfunction getBestPlainText(response) {\n  const candidates = [];\n  candidates.push(...extractTextFromKnownShapes(response));\n  candidates.push(...collectStringCandidates(response, []));\n\n  const unique = [...new Set(candidates.map(v => String(v || '').trim()).filter(Boolean))];\n  unique.sort((a, b) => b.length - a.length);\n  return unique[0] || '';\n}\n\nfunction getArticleUrls() {\n  const nodeNames = ['extract_news', '1.extract_news_prd', 'extract_news_prd', '1.extract_news_prd_v5_2_grounded'];\n\n  for (const nodeName of nodeNames) {\n    try {\n      const data = $(nodeName).first().json;\n      if (data && Array.isArray(data.article_urls) && data.article_urls.length > 0) {\n        console.log(`URLs 발견 (${nodeName}):`, JSON.stringify(data.article_urls));\n        return data.article_urls;\n      }\n    } catch (_) {\n      // ignore and continue\n    }\n  }\n\n  return [\n    'https://news.google.com/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRGRqTVhZU0FtdHZHZ0pMVWlnQVAB?hl=ko&gl=KR&ceid=KR%3Ako',\n    'https://www.newswire.co.kr',\n    'https://www.dailysecu.com',\n    'https://www.etnews.com',\n    'https://www.krcert.or.kr'\n  ];\n}\n\nconst articleUrls = getArticleUrls();\n\nfunction getArticleTitles() {\n  const nodeNames = ['extract_news', '1.extract_news_prd', 'extract_news_prd', '1.extract_news_prd_v5_2_grounded'];\n\n  for (const nodeName of nodeNames) {\n    try {\n      const data = $(nodeName).first().json;\n\n      if (Array.isArray(data?.article_titles) && data.article_titles.length > 0) {\n        return data.article_titles.map(v => String(v || '').trim()).filter(Boolean);\n      }\n\n      if (data?.article_title_map && typeof data.article_title_map === 'object') {\n        const entries = Object.entries(data.article_title_map)\n          .map(([k, v]) => [Number(k), String(v || '').trim()])\n          .filter(([k, v]) => Number.isInteger(k) && k > 0 && v.length > 0)\n          .sort((a, b) => a[0] - b[0]);\n        if (entries.length > 0) {\n          return entries.map(([, v]) => v);\n        }\n      }\n\n      const userPrompt = data?.messages?.find((m) => m?.role === 'user')?.content || '';\n      if (typeof userPrompt === 'string' && userPrompt.length > 0) {\n        // v5.2 포맷: \"입력 기사 JSON:\" 아래 배열에서 제목 추출\n        const jsonMarker = '입력 기사 JSON:';\n        const markerIndex = userPrompt.indexOf(jsonMarker);\n        if (markerIndex >= 0) {\n          const jsonPart = userPrompt.slice(markerIndex + jsonMarker.length).trim();\n          const parsedJson = tryParseJsonFragments(jsonPart);\n          if (Array.isArray(parsedJson)) {\n            const titlesFromJson = parsedJson\n              .map((item) => String(item?.title || '').trim())\n              .filter(Boolean);\n            if (titlesFromJson.length > 0) return titlesFromJson;\n          }\n        }\n\n        const lines = userPrompt.split('\\n');\n        const parsed = [];\n        for (const raw of lines) {\n          const line = String(raw || '').trim();\n          if (!line) continue;\n          if (/^출력 형식/.test(line) || /^📌/.test(line)) break;\n          const m = line.match(/^\\d+[.)]\\s*(.+)$/);\n          if (m && m[1]) parsed.push(m[1].trim());\n        }\n        if (parsed.length > 0) return parsed.slice(0, 10);\n      }\n    } catch (_) {\n      // ignore and continue\n    }\n  }\n\n  return [];\n}\n\nconst articleTitles = getArticleTitles();\nconst articleTitleMap = Object.fromEntries(articleTitles.map((t, i) => [String(i + 1), t]));\n\nfunction buildFallbackInsightsFromArticles(articles) {\n  const bulletTexts = (articles || [])\n    .flatMap((a) => Array.isArray(a?.summary_bullets) ? a.summary_bullets : [])\n    .map((v) => String(v || '').trim())\n    .filter(Boolean);\n\n  if (bulletTexts.length === 0) return [];\n\n  const fullText = bulletTexts.join(' ').toLowerCase();\n  const themes = [\n    { label: '환자정보·개인정보 보호', keys: ['개인정보', '유출', 'leak', 'breach', '민감정보'] },\n    { label: '진료서비스 연속성', keys: ['공격', '해킹', '침해', 'ddos', '디도스', '랜섬웨어', '악성코드'] },\n    { label: '취약점·패치 관리', keys: ['취약점', 'cve', '패치', '업데이트'] },\n    { label: '사고 대응체계·보고', keys: ['대응', '조치', '통보', '개편', '본부', '강화'] },\n    { label: '계정·접근통제 강화', keys: ['계정', '자격증명', 'credential', '인증'] },\n    { label: '협력사·공급망 보안', keys: ['공급망', '협력사', '외주', 'third party', 'supply'] }\n  ];\n\n  const ranked = themes\n    .map((t) => ({\n      label: t.label,\n      score: t.keys.reduce((acc, k) => acc + (fullText.includes(k) ? 1 : 0), 0)\n    }))\n    .filter((t) => t.score > 0)\n    .sort((a, b) => b.score - a.score);\n\n  const topThemes = ranked.slice(0, 3).map((r) => r.label);\n  const insights = [];\n\n  if (topThemes.length > 0) {\n    insights.push(`${topThemes.join(', ')} 이슈가 반복된 점을 반영해 동일 유형 시스템의 점검 주기를 단축해야 한다.`);\n  }\n\n  insights.push('진료 중단으로 이어질 수 있는 공격 시나리오를 기준으로 비상운영 절차와 복구 우선순위를 사전에 점검해야 한다.');\n  insights.push('환자정보 접근 계정과 외부 연계 계정을 분리 관리하고, 이상 로그인과 권한 오남용 모니터링을 상시 강화해야 한다.');\n\n  return insights.slice(0, 3);\n}\n\nfunction isMedicalContextInsight(insight) {\n  const t = String(insight || '').toLowerCase();\n  const medicalKeywords = ['의료', '환자', '진료', '처방', '의무기록', 'emr', 'pacs', '검사', '원무'];\n  return medicalKeywords.some((k) => t.includes(k));\n}\n\nfunction buildMedicalInsights(modelInsights, articles) {\n  const base = Array.isArray(modelInsights)\n    ? modelInsights.map((v) => String(v || '').trim()).filter(Boolean)\n    : [];\n\n  const sanitizedBase = base.map((line) =>\n    line\n      .replace(/의료서비스\\s*운영\\s*조직은\\s*/g, '')\n      .replace(/의료서비스\\s*운영\\s*조직이\\s*/g, '')\n      .trim()\n  );\n\n  const medicalCount = sanitizedBase.filter(isMedicalContextInsight).length;\n  if (sanitizedBase.length >= 3 && medicalCount >= 2) {\n    return sanitizedBase.slice(0, 3);\n  }\n\n  return buildFallbackInsightsFromArticles(articles);\n}\n\nlet html = '<div style=\"font-family: Malgun Gothic, sans-serif; color: #333;\">';\nhtml += '<h2 style=\"color:#007cba; font-size:16pt; font-weight:bold;\">📢 ' + year + '년 ' + month + '월 보안 뉴스 TOP 5</h2>';\nhtml += '<p style=\"font-size:10pt; margin-top:15px;\">안녕하세요, 기획개발팀입니다. 이번 달 주요 보안 이슈를 전달드립니다.</p>';\nhtml += '<p style=\"font-size:10pt; margin-top:15px;\">본 정보보안 뉴스레터는 AI 기반으로 관련 뉴스를 선별하고, 요약 및 시사점을 도출하여 구성되었습니다. 다만 AI 기반 분석 특성상 일부 내용은 해석이나 관점에 차이가 있을 수 있는 점 참고 부탁드립니다.</p>';\nhtml += '<hr style=\"border:2px solid #007cba; margin:20px 0;\">';\n\nfunction renderArticleCard(index, title, bullets, url) {\n  const safeTitle = escapeHtml(title || `기사 ${index}`);\n  const safeBullets = (bullets || []).map(v => String(v || '').trim()).filter(Boolean);\n\n  let section = '';\n  section += '<div style=\"margin:25px 0; padding:20px; background:#f9f9f9; border-left:4px solid #007cba; border-radius:4px;\">';\n  section += '<strong style=\"font-size:12pt; color:#2c3e50; display:block; margin-bottom:10px;\">' + index + '. ' + safeTitle + '</strong>';\n\n  if (safeBullets.length > 0) {\n    section += '<ul style=\"margin:0 0 10px 0; padding:0 0 0 20px; line-height:1.8;\">';\n    for (const bullet of safeBullets) {\n      section += '<li style=\"font-size:10pt; color:#555; margin-bottom:8px;\">' + escapeHtml(bullet) + '</li>';\n    }\n    section += '</ul>';\n  }\n\n  section += '<a href=\"' + escapeHtml(url || 'https://www.dailysecu.com') + '\" target=\"_blank\" style=\"color:#007cba; font-size:10pt; text-decoration:none;\">🔗 기사보기</a>';\n  section += '</div>';\n  return section;\n}\n\nfunction renderInsights(items) {\n  const safeItems = (items || []).map(v => String(v || '').trim()).filter(Boolean);\n  if (safeItems.length === 0) return '';\n\n  let section = '';\n  section += '<hr style=\"border:1px solid #007cba; margin:20px 0;\">';\n  section += '<div style=\"background:#f0f8ff; border-left:4px solid #007cba; padding:15px; margin:20px 0;\">';\n  section += '<strong style=\"font-size:12pt; color:#007cba; display:block; margin-bottom:10px;\">📌 이번 달 보안 시사점</strong>';\n  section += '<ul style=\"margin:0; padding:0 0 0 20px; line-height:1.8;\">';\n  for (const item of safeItems) {\n    section += '<li style=\"font-size:10pt; color:#555; margin-bottom:8px;\">' + escapeHtml(item) + '</li>';\n  }\n  section += '</ul>';\n  section += '</div>';\n  return section;\n}\n\nlet renderedArticleCount = 0;\nconst structured = getStructuredPayload(aiResponse);\n\nif (structured && Array.isArray(structured.articles) && structured.articles.length > 0) {\n  for (let i = 0; i < structured.articles.length; i++) {\n    const article = structured.articles[i] || {};\n    const articleId = Number(article.id);\n    const mappedTitle = Number.isInteger(articleId) && articleId > 0\n      ? (articleTitleMap[String(articleId)] || articleTitles[articleId - 1] || '')\n      : '';\n    const modelTitle = String(article.title || '').trim();\n    const genericTitle = /^(기사\\s*\\d+|article\\s*\\d+)$/i.test(modelTitle);\n    const title = (!genericTitle && modelTitle) || mappedTitle || articleTitles[i] || `기사 ${i + 1}`;\n    const bullets = Array.isArray(article.summary_bullets) ? article.summary_bullets : [];\n    const url = articleUrls[i] || 'https://www.dailysecu.com';\n\n    html += renderArticleCard(i + 1, title, bullets, url);\n    renderedArticleCount += 1;\n  }\n  const insightItems = buildMedicalInsights(structured.monthly_insights, structured.articles);\n  html += renderInsights(insightItems);\n} else {\n  const aiText = getBestPlainText(aiResponse).replace(/\\*\\*/g, '');\n  const lines = aiText.split('\\n');\n\n  let newsCount = 0;\n  let currentTitle = '';\n  let currentSummary = '';\n  let inInsight = false;\n  const insightItems = [];\n  const parsedArticles = [];\n\n  function flushArticle() {\n    if (!currentTitle) return;\n\n    const bullets = currentSummary\n      .split(/\\n|•|\\s-\\s|\\r\\n/)\n      .map(s => s.trim())\n      .filter(Boolean);\n\n    const url = articleUrls[newsCount - 1] || 'https://www.dailysecu.com';\n    html += renderArticleCard(newsCount, currentTitle, bullets, url);\n    renderedArticleCount += 1;\n    parsedArticles.push({ summary_bullets: bullets });\n\n    currentTitle = '';\n    currentSummary = '';\n  }\n\n  for (const raw of lines) {\n    const line = String(raw || '').trim();\n    if (!line) continue;\n\n    if (line.includes('📌') || line.toLowerCase().includes('시사점')) {\n      flushArticle();\n      inInsight = true;\n      continue;\n    }\n\n    if (inInsight) {\n      if (line.startsWith('-') || line.startsWith('•')) {\n        insightItems.push(line.replace(/^[-•]\\s*/, ''));\n      }\n      continue;\n    }\n\n    if (/^(\\d+[.)]\\s*|기사\\s*\\d+\\s*[:.]\\s*)/.test(line)) {\n      flushArticle();\n      newsCount += 1;\n      currentTitle = line.replace(/^(\\d+[.)]\\s*|기사\\s*\\d+\\s*[:.]\\s*)/, '').trim();\n      continue;\n    }\n\n    if (line.includes('🔗') || line.includes('기사보기') || /^https?:\\/\\//.test(line)) {\n      continue;\n    }\n\n    currentSummary += line + ' ';\n  }\n\n  flushArticle();\n  html += renderInsights(buildMedicalInsights(insightItems, parsedArticles));\n}\n\nif (renderedArticleCount === 0) {\n  html += '<div style=\"margin:25px 0; padding:20px; background:#fff3cd; border-left:4px solid #f39c12; border-radius:4px;\">';\n  html += '<strong style=\"font-size:11pt; color:#856404;\">기사 제목/요약을 파싱하지 못했습니다.</strong>';\n  html += '<p style=\"font-size:10pt; color:#856404; margin-top:8px;\">raw 응답 키 구조를 확인해 파서를 맞춰야 합니다.</p>';\n  html += '</div>';\n  const preview = JSON.stringify(aiResponse);\n  console.log('⚠️ newsletter_form_v3 parse-failed renderedArticleCount=0');\n  console.log('⚠️ newsletter_form_v3 raw keys:', Object.keys(aiResponse || {}).join(', '));\n  console.log('⚠️ newsletter_form_v3 raw preview:', preview.slice(0, 1500));\n} else {\n  console.log('✅ newsletter_form_v3 renderedArticleCount=', renderedArticleCount);\n  console.log('ℹ️ newsletter_form_v3 articleTitlesCount=', articleTitles.length);\n}\n\nhtml += '<hr style=\"border:2px solid #007cba; margin:20px 0;\">';\nhtml += '<p style=\"color:#7f8c8d; font-size:9pt;\">기획개발팀 | itplan@smlab.co.kr</p>';\nhtml += '</div>';\n\nconst subject = '[보안뉴스] ' + month + '월 정보보안 뉴스레터';\n\nreturn [{ json: { subject, html } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        256,
+        -16
+      ],
+      "id": "a7075515-90a2-4ce7-915f-99b407ea8730",
+      "name": "newsletter_form"
+    },
+    {
+      "parameters": {
+        "url": "http://rss.etnews.com/04045.xml",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.2,
+      "position": [
+        -768,
+        -240
+      ],
+      "id": "6ec76785-2f69-43d5-9bd8-889e1957d670",
+      "name": "etnews"
+    },
+    {
+      "parameters": {
+        "jsCode": "const now = new Date();\nconst subject = $input.first().json.subject;\nconst htmlContent = $input.first().json.html;\n\n// 안전한 HTML 이스케이프 함수 (XSS 방지)\nfunction escapeHtml(text) {\n  return text\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;')\n    .replace(/\"/g, '&quot;')\n    .replace(/'/g, '&#039;');\n}\n\nconst approvalEmailTemplate = `\n<!DOCTYPE html>\n<html lang=\"ko\">\n<head>\n  <meta charset=\"UTF-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n  <meta name=\"x-apple-disable-message-reformatting\">\n  <!--[if mso]>\n  <style type=\"text/css\">\n    table {border-collapse: collapse;}\n    .btn a {padding: 16px 60px !important;}\n  </style>\n  <![endif]-->\n  <style>\n    body { \n      font-family: 'Malgun Gothic', 'Apple SD Gothic Neo', Arial, sans-serif; \n      margin: 0; \n      padding: 20px; \n      background: #f5f5f5;\n      -webkit-text-size-adjust: 100%;\n      -ms-text-size-adjust: 100%;\n    }\n    .container { \n      max-width: 900px; \n      margin: 0 auto; \n      background: white; \n      border-radius: 10px; \n      overflow: hidden; \n      box-shadow: 0 2px 10px rgba(0,0,0,0.1); \n    }\n    .header { \n      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); \n      color: white; \n      padding: 30px; \n      text-align: center; \n    }\n    .header h1 { \n      margin: 0; \n      font-size: 24px; \n    }\n    .preview { \n      padding: 30px; \n      border-bottom: 2px dashed #e0e0e0; \n      background: #fafafa; \n    }\n    .preview-label { \n      color: #666; \n      font-size: 14px; \n      margin-bottom: 15px; \n      font-weight: bold; \n    }\n    .button-container { \n      padding: 40px 20px; \n      text-align: center; \n      background: white; \n    }\n    .footer { \n      padding: 20px; \n      background: #f8f9fa; \n      text-align: center; \n      font-size: 12px; \n      color: #6c757d; \n    }\n    .info-box { \n      background: #e7f3ff; \n      border-left: 4px solid #007cba; \n      padding: 15px; \n      margin: 20px 30px; \n      font-size: 14px;\n    }\n    @media only screen and (max-width: 600px) {\n      .container { \n        width: 100% !important; \n        border-radius: 0 !important; \n      }\n      .button-container { \n        padding: 30px 15px !important; \n      }\n    }\n  </style>\n</head>\n<body>\n  <div class=\"container\">\n    <div class=\"header\">\n      <h1>📧 보안 뉴스레터 승인 요청</h1>\n      <p style=\"margin: 10px 0 0 0; opacity: 0.9;\">아래 내용을 검토 후 승인해주세요</p>\n    </div>\n    \n    <div class=\"preview\">\n      <div class=\"preview-label\">📰 발송될 뉴스레터 미리보기:</div>\n      <div style=\"background: white; padding: 20px; border-radius: 5px; border: 1px solid #e0e0e0; max-height: 500px; overflow-y: auto;\">\n        ${htmlContent}\n      </div>\n    </div>\n    \n    <div class=\"button-container\">\n      <p style=\"color: #495057; margin-bottom: 30px; font-size: 16px; font-weight: 500;\">\n        내용 확인 후 아래 버튼을 클릭하세요\n      </p>\n      \n      <!-- 승인 버튼 (Outlook 호환) -->\n      <table cellpadding=\"0\" cellspacing=\"0\" border=\"0\" align=\"center\" style=\"margin: 0 auto 20px auto;\">\n        <tr>\n          <td align=\"center\" style=\"background-color: #28a745; border-radius: 8px; box-shadow: 0 4px 12px rgba(40,167,69,0.3);\">\n            <!--[if mso]>\n            <v:roundrect xmlns:v=\"urn:schemas-microsoft-com:vml\" xmlns:w=\"urn:schemas-microsoft-com:office:word\" href=\"RESUME_URL_PLACEHOLDER?action=approve\" style=\"height:54px;v-text-anchor:middle;width:200px;\" arcsize=\"15%\" strokecolor=\"#28a745\" fillcolor=\"#28a745\">\n            <w:anchorlock/>\n            <center style=\"color:#ffffff;font-family:sans-serif;font-size:18px;font-weight:bold;\">✅ 승인 및 발송</center>\n            </v:roundrect>\n            <![endif]-->\n            <a href=\"RESUME_URL_PLACEHOLDER?action=approve\" target=\"_blank\" rel=\"noopener\" style=\"display: block; padding: 16px 60px; color: #ffffff; text-decoration: none; font-size: 18px; font-weight: bold; mso-hide: all;\">\n              ✅ 승인 및 발송\n            </a>\n          </td>\n        </tr>\n      </table>\n      \n      <p style=\"text-align: center; color: #999; font-size: 14px; margin: 15px 0;\">또는</p>\n      \n      <!-- 거부 버튼 (Outlook 호환) -->\n      <table cellpadding=\"0\" cellspacing=\"0\" border=\"0\" align=\"center\" style=\"margin: 0 auto;\">\n        <tr>\n          <td align=\"center\" style=\"background-color: #dc3545; border-radius: 8px; box-shadow: 0 4px 12px rgba(220,53,69,0.3);\">\n            <!--[if mso]>\n            <v:roundrect xmlns:v=\"urn:schemas-microsoft-com:vml\" xmlns:w=\"urn:schemas-microsoft-com:office:word\" href=\"RESUME_URL_PLACEHOLDER?action=reject\" style=\"height:54px;v-text-anchor:middle;width:200px;\" arcsize=\"15%\" strokecolor=\"#dc3545\" fillcolor=\"#dc3545\">\n            <w:anchorlock/>\n            <center style=\"color:#ffffff;font-family:sans-serif;font-size:18px;font-weight:bold;\">❌ 발송 거부</center>\n            </v:roundrect>\n            <![endif]-->\n            <a href=\"RESUME_URL_PLACEHOLDER?action=reject\" target=\"_blank\" rel=\"noopener\" style=\"display: block; padding: 16px 60px; color: #ffffff; text-decoration: none; font-size: 18px; font-weight: bold; mso-hide: all;\">\n              ❌ 발송 거부\n            </a>\n          </td>\n        </tr>\n      </table>\n    </div>\n    \n    <div class=\"info-box\">\n      <strong>ℹ️ 안내사항</strong><br>\n      • 승인 링크는 <strong>24시간</strong> 동안 유효합니다<br>\n      • 클릭 시 즉시 처리되며 되돌릴 수 없습니다<br>\n      • 발송 대상: 기획개발팀 전체 (itplan@smlab.co.kr)<br>\n      • 24시간 내 미응답 시 자동 취소됩니다\n    </div>\n    \n    <div class=\"footer\">\n      <p><strong>요청 시간:</strong> ${now.toLocaleString('ko-KR', {\n        timeZone: 'Asia/Seoul',\n        year: 'numeric',\n        month: 'long',\n        day: 'numeric',\n        hour: '2-digit',\n        minute: '2-digit',\n        second: '2-digit',\n        hour12: true\n      })}</p>\n      <p><strong>제목:</strong> ${escapeHtml(subject)}</p>\n      <p style=\"margin-top: 15px; color: #999; font-size: 11px;\">\n        이 이메일은 자동으로 생성되었습니다 | 기획개발팀<br>\n        본 메일은 발신 전용이므로 회신되지 않습니다\n      </p>\n    </div>\n  </div>\n</body>\n</html>\n`;\n\nreturn [{\n  json: {\n    approval_subject: '[승인 필요] ' + subject,\n    approval_html: approvalEmailTemplate,\n    newsletter_subject: subject,\n    newsletter_html: htmlContent,\n    requested_at: now.toISOString(),\n    requester: 'system'\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        496,
+        -16
+      ],
+      "id": "6eb8e06c-3c78-47b1-a4d0-ba6fc86c15e1",
+      "name": "prepare_approval"
+    },
+    {
+      "parameters": {
+        "fromEmail": "itplan@smlab.co.kr",
+        "toEmail": "gjcho@smlab.co.kr",
+        "subject": "={{ $json.approval_subject }}",
+        "html": "={{ $json.approval_html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        992,
+        -16
+      ],
+      "id": "f1421bdb-77ad-4336-861d-d23025c36b3c",
+      "name": "Send Approval Request",
+      "webhookId": "c1410167-491c-47d9-a337-03e0955136c0",
+      "credentials": {
+        "smtp": {
+          "id": "GgDSFRsK8czpmjer",
+          "name": "SMTP account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resume": "webhook",
+        "responseMode": "lastNode",
+        "limitWaitTime": true,
+        "resumeAmount": 24,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1216,
+        -16
+      ],
+      "id": "f13874de-5f5d-4b9c-8aab-35cf43fdfa30",
+      "name": "Wait for Approval",
+      "webhookId": "394947e3-324b-4882-8485-e29974d421eb"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.query.action }}",
+                    "rightValue": "approve",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "bb5a7ad2-aefc-4b3e-a051-44dbf86b0a9e"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "0e3cfc95-521e-4d1f-8f01-2d86542cba62",
+                    "leftValue": "={{ $json.query.action }}",
+                    "rightValue": "reject",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        1456,
+        -16
+      ],
+      "id": "8e434b60-2e8b-4f60-b140-55e927ea687b",
+      "name": "Check Action"
+    },
+    {
+      "parameters": {
+        "fromEmail": "itplan@smlab.co.kr",
+        "toEmail": "bizboxa_gsmlab_c1000@smlab.co.kr,bizboxa_gsmlab_c2000@smlab.co.kr",
+        "subject": "={{ $('prepare_approval').first().json.newsletter_subject }}",
+        "html": "=\t{{ $('prepare_approval').first().json.newsletter_html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1664,
+        -144
+      ],
+      "id": "0967e747-981a-409b-8733-4882d9b6a4e7",
+      "name": "Send Newsletter",
+      "webhookId": "f8a843a4-5386-44f0-832d-4c2175e4bb6c",
+      "credentials": {
+        "smtp": {
+          "id": "GgDSFRsK8czpmjer",
+          "name": "SMTP account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fromEmail": "itplan@smlab.co.kr",
+        "toEmail": "itplan@smlab.co.kr",
+        "subject": "[거부됨] 뉴스레터 발송 취소",
+        "html": "=<!DOCTYPE html>\n<html>\n<head><meta charset=\"UTF-8\"></head>\n<body style=\"font-family: Arial; padding: 20px; background: #f5f5f5;\">\n  <div style=\"max-width: 600px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);\">\n    <h2 style=\"color: #dc3545; margin-top: 0;\">❌ 뉴스레터 발송이 거부되었습니다</h2>\n    \n    <table style=\"width: 100%; border-collapse: collapse; margin: 20px 0;\">\n      <tr>\n        <td style=\"padding: 10px; background: #f8f9fa; border: 1px solid #dee2e6; font-weight: bold; width: 120px;\">제목</td>\n        <td style=\"padding: 10px; border: 1px solid #dee2e6;\">{{ $('prepare_approval').first().json.newsletter_subject }}</td>\n      </tr>\n      <tr>\n        <td style=\"padding: 10px; background: #f8f9fa; border: 1px solid #dee2e6; font-weight: bold;\">거부 시간</td>\n        <td style=\"padding: 10px; border: 1px solid #dee2e6;\">{{ new Date().toLocaleString('ko-KR', {timeZone: 'Asia/Seoul', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true}) }}</td>\n      </tr>\n      <tr>\n        <td style=\"padding: 10px; background: #f8f9fa; border: 1px solid #dee2e6; font-weight: bold;\">요청 시간</td>\n        <td style=\"padding: 10px; border: 1px solid #dee2e6;\">{{ new Date($('prepare_approval').first().json.requested_at).toLocaleString('ko-KR', {\n      timeZone: 'Asia/Seoul',\n      year: 'numeric',\n      month: 'long',\n      day: 'numeric',\n      hour: '2-digit',\n      minute: '2-digit',\n      second: '2-digit',\n      hour12: true\n    }) }}</td>\n      </tr>\n    </table>\n    \n    <div style=\"background: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin: 20px 0;\">\n      <strong>📌 안내사항</strong><br>\n      • 다음 스케줄에 새로운 뉴스레터가 자동 생성됩니다<br>\n      • 문의사항은 기획개팀으로 연락 바랍니다\n    </div>\n    \n    <p style=\"color: #6c757d; font-size: 12px; text-align: center; margin-top: 30px;\">\n      이 이메일은 자동으로 생성되었습니다 | 기획개발팀\n    </p>\n  </div>\n</body>\n</html>",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1664,
+        64
+      ],
+      "id": "e0d61b96-287a-4bb6-94fb-0d8f9b182ec6",
+      "name": "Notify Rejection",
+      "webhookId": "651483ea-4975-474b-90d4-157405d73d13",
+      "credentials": {
+        "smtp": {
+          "id": "GgDSFRsK8czpmjer",
+          "name": "SMTP account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "try {\n  const inputData = $input.first().json;\n  const approvalHtml = inputData.approval_html;\n  \n  // $execution.resumeUrl 가져오기\n  const resumeUrl = $execution.resumeUrl;\n  \n  // URL 유효성 검사\n  if (!resumeUrl || resumeUrl === '') {\n    throw new Error('Resume URL이 생성되지 않았습니다. Wait 노드가 다음에 있는지 확인하세요.');\n  }\n  \n  // PLACEHOLDER를 실제 URL로 치환\n  const finalHtml = approvalHtml.replace(/RESUME_URL_PLACEHOLDER/g, resumeUrl);\n  \n  // 치환 확인\n  if (finalHtml.includes('RESUME_URL_PLACEHOLDER')) {\n    console.warn('일부 PLACEHOLDER가 치환되지 않았습니다.');\n  }\n  \n  console.log('✅ Resume URL 치환 완료:', resumeUrl);\n  \n  return [{\n    json: {\n      approval_subject: inputData.approval_subject,\n      approval_html: finalHtml,\n      newsletter_subject: inputData.newsletter_subject,\n      newsletter_html: inputData.newsletter_html,\n      requested_at: inputData.requested_at,\n      resume_url: resumeUrl\n    }\n  }];\n  \n} catch (error) {\n  console.error('❌ Resume URL 치환 오류:', error.message);\n  throw error;\n}"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        736,
+        -16
+      ],
+      "id": "7c3c9211-735e-495a-a33e-73b5229b6346",
+      "name": "replace_resume_url"
+    },
+    {
+      "parameters": {
+        "url": "https://api.newswire.co.kr/rss/industry/609",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.2,
+      "position": [
+        -768,
+        80
+      ],
+      "id": "b890aa0e-1ee9-48ea-9667-223c5cdf872a",
+      "name": "newswire"
+    },
+    {
+      "parameters": {
+        "url": "https://news.google.com/rss/headlines/section/topic/TECHNOLOGY?hl=ko&gl=KR&ceid=KR:ko",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.2,
+      "position": [
+        -768,
+        240
+      ],
+      "id": "a3c7cea7-9a8f-4123-8168-0e7411155a10",
+      "name": "google"
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "etnews",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "dailysecu",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "newswire",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "google",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "dailysecu": {
+      "main": [
+        [
+          {
+            "node": "newsMerge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "newsMerge": {
+      "main": [
+        [
+          {
+            "node": "extract_news",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "extract_news": {
+      "main": [
+        [
+          {
+            "node": "exaone_ai",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "exaone_ai": {
+      "main": [
+        [
+          {
+            "node": "newsletter_form",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "newsletter_form": {
+      "main": [
+        [
+          {
+            "node": "prepare_approval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "etnews": {
+      "main": [
+        [
+          {
+            "node": "newsMerge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "prepare_approval": {
+      "main": [
+        [
+          {
+            "node": "replace_resume_url",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Approval Request": {
+      "main": [
+        [
+          {
+            "node": "Wait for Approval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait for Approval": {
+      "main": [
+        [
+          {
+            "node": "Check Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Action": {
+      "main": [
+        [
+          {
+            "node": "Send Newsletter",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify Rejection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "replace_resume_url": {
+      "main": [
+        [
+          {
+            "node": "Send Approval Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "newswire": {
+      "main": [
+        [
+          {
+            "node": "newsMerge",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "google": {
+      "main": [
+        [
+          {
+            "node": "newsMerge",
+            "type": "main",
+            "index": 3
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "pinData": {},
+  "versionId": "9e701a11-eb42-4a56-a5cb-c1634886ca74",
+  "activeVersionId": "306329fa-776c-470e-92d8-107470f74d82",
+  "versionCounter": 219,
+  "triggerCount": 1,
+  "tags": []
+}

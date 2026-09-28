@@ -1,0 +1,6 @@
+# 모델 파일 (4.8GB, GitHub 용량 제한 초과)
+models/
+
+# 실제 운영 compose (N8N_ENCRYPTION_KEY 포함) — docker-compose.example.yml 참고
+n8n/docker-compose.yml
+.env

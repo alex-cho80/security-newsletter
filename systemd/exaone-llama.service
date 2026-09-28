@@ -1,0 +1,21 @@
+[Unit]
+Description=EXAONE LLM Server via llama.cpp
+After=network.target
+
+[Service]
+Type=simple
+User=itplan
+WorkingDirectory=/home/itplan/llama.cpp
+Environment="MODEL_PATH=/home/itplan/sec-newsletter/models/EXAONE-3.5-7.8B-Instruct-Q4_K_M.gguf"
+ExecStart=/home/itplan/llama.cpp/build/bin/llama-server \
+    --model ${MODEL_PATH} \
+    --host 0.0.0.0 \
+    --port 8080 \
+    --ctx-size 8192 \
+    --n-gpu-layers 0 \
+    --threads 6
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
